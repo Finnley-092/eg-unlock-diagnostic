@@ -1,0 +1,953 @@
+'use strict';
+/*
+ * Egret Tuning - Web Bluetooth. Implements the BLE protocol proven from de.walberg.egret 2.0.60.
+ * Proven: characteristic UUIDs, command opcodes, EY packet format, CRC16, scramble, per-model
+ * capabilities (drive modes, X-mode, automatic headlights). Inferred: the service UUIDs of the
+ * modern family (characteristic base with a 0 in the last nibble), matching the proven identifier
+ * service 70D1B670 whose characteristics are ...672/673/674.
+ */
+
+// The pre-commit cache-buster auto-bumps BUILD and every ?v= in index.html on any web-asset change.
+const BUILD = 'v26-uuid-normalization-1';
+
+// --------------------------- UUIDs (Web Bluetooth wants lowercase) ---------------------------
+const U = {
+  OP_SVC:  '7d971cd0-8ebd-4684-b771-b2362b7e922a',
+  OP_CMD:  '7d971cd1-8ebd-4684-b771-b2362b7e922a',
+  OP_STAT: '7d971cd2-8ebd-4684-b771-b2362b7e922a',
+  OP_ODO:  '7d971cd3-8ebd-4684-b771-b2362b7e922a',
+  SET_SVC: 'bccae7e0-458d-4554-8d8a-ddadd926efe3',
+  SET_CMD: 'bccae7e1-458d-4554-8d8a-ddadd926efe3',
+  SET_STAT:'bccae7e2-458d-4554-8d8a-ddadd926efe3',
+  CUST:    'bccae7e3-458d-4554-8d8a-ddadd926efe3',
+  DIA_SVC: '2b419d90-adef-4ca3-8652-c02093b6c84e',
+  DIA_STAT:'2b419d92-adef-4ca3-8652-c02093b6c84e',
+  BAT_SVC: 'f4b68c10-9e9e-4b97-a9c9-272e32453252',
+  BAT_LVL: 'f4b68c11-9e9e-4b97-a9c9-272e32453252',
+  BAT_FW:  'f4b68c12-9e9e-4b97-a9c9-272e32453252',
+  BAT_INFO:'f4b68c13-9e9e-4b97-a9c9-272e32453252',
+  BAT_DIAG:'f4b68c14-9e9e-4b97-a9c9-272e32453252',
+  ID_SVC:  '70d1b670-eba5-4d76-868f-6d1b66108fdc',
+  BAT_STD_SVC: '0000180f-0000-1000-8000-00805f9b34fb',
+  BAT_STD: '00002a19-0000-1000-8000-00805f9b34fb',
+  DEV_SVC: '0000180a-0000-1000-8000-00805f9b34fb',
+  DEV_SERIAL: '00002a25-0000-1000-8000-00805f9b34fb',
+  DEV_FW:  '00002a26-0000-1000-8000-00805f9b34fb',
+  EY_SVC:  '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+  EY_WR:   '6e400002-b5a3-f393-e0a9-e50e24dcca9e',
+  EY_NO:   '6e400003-b5a3-f393-e0a9-e50e24dcca9e'
+};
+const MODERN_OPT_SVCS = [U.OP_SVC, U.SET_SVC, U.DIA_SVC, U.BAT_SVC, U.ID_SVC, U.BAT_STD_SVC, U.DEV_SVC];
+
+// --------------------------- per-model capabilities (proven from the app code) ---------------------------
+// fam: 'modern' uses SETTINGS SetSpeedLimit (km/h); 'ey' uses the Nordic UART gear/X-mode.
+// names: advertised-name prefixes used for auto detect. speed: has a BT speed lever (kept for tuning).
+// xmode: EY X-mode present (proven only for EY1/EY2/EY2p). headlight: automatic headlights (GT only).
+// modes: modern ride modes offered (wire enum 0..3). tunable=false only marks "no proven speed lever".
+const MODELS = {
+  X:       { fam: 'modern', label: 'Egret X',        names: ['EGRET X'],      speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  X_CORE:  { fam: 'modern', label: 'Egret X Core',   names: ['EGRET X CORE'], speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  X_PRIME: { fam: 'modern', label: 'Egret X Prime',  names: ['EGRET X PRIME'],speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  X_ULTRA: { fam: 'modern', label: 'Egret X Ultra',  names: ['EGRET X ULTRA'],speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  PRO:     { fam: 'modern', label: 'Egret Pro',      names: ['EGRET PRO'],    speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  PRO_FX:  { fam: 'modern', label: 'Egret Pro FX',   names: ['EGRET PRO FX'], speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  ONE:     { fam: 'modern', label: 'Egret One',      names: ['EGRET ONE'],    speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  GT:      { fam: 'modern', label: 'Egret GT',       names: ['EGRET GT'],     speed: true,  modes: [0,1,2,3], bright: true, reset: true, headlight: true },
+  GTS:     { fam: 'modern', label: 'Egret GTs',      names: ['EGRET GTS'],    speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  GTC:     { fam: 'modern', label: 'Egret GTc',      names: ['EGRET GTC'],    speed: true,  modes: [0,1,2,3], bright: true, reset: true },
+  UNIT:    { fam: 'modern', label: 'Egret Unit',     names: ['EGRET UNIT'],   speed: true,  modes: [0,1,2,3], bright: true, reset: true, note: 'unit' },
+  EY1:     { fam: 'ey', label: 'EY1', names: ['EY', 'YD'], speed: true,  xmode: true },
+  EY2:     { fam: 'ey', label: 'EY2', names: ['EY', 'YD'], speed: true,  xmode: true },
+  EY2P:    { fam: 'ey', label: 'EY2p',names: ['EY', 'YD'], speed: true,  xmode: true },
+  EY3:     { fam: 'ey', label: 'EY3', names: ['EY', 'YD'], speed: false, xmode: false },
+  EY6:     { fam: 'ey', label: 'EY6', names: ['EY', 'YD'], speed: false, xmode: false },
+  EY6P:    { fam: 'ey', label: 'EY6p',names: ['EY', 'YD'], speed: false, xmode: false },
+  EY7:     { fam: 'ey', label: 'EY7', names: ['EY', 'YD'], speed: false, xmode: false },
+  EYS:     { fam: 'ey', label: 'EYS', names: ['EY', 'YD'], speed: false, xmode: false }
+};
+const MODERN_KEYS = Object.keys(MODELS).filter(k => MODELS[k].fam === 'modern');
+
+// --------------------------- helpers ---------------------------
+const $ = (id) => document.getElementById(id);
+const hex = (arr) => Array.from(arr, b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+const short = (u) => String(u).slice(0, 8).toUpperCase();
+const LS = { THEME: 'eg_theme', MODEL: 'eg_model', OPEN: 'eg_open', EKFV: 'eg_ekfv', PUBLOG: 'eg_publiclog' };
+
+let dev = null, server = null, chars = {}, model = 'auto', busy = false;
+let connected = false;      // drives card visibility (cards stay hidden until connected)
+let curSpeedLimit = null;   // current km/h limit read live from SETTINGS_STATUS, or null if unknown
+function cap() { return MODELS[model] || null; }
+function fam() { const c = cap(); return c ? c.fam : 'auto'; }
+
+// --------------------------- log ---------------------------
+let logBuffer = [];    // { raw, cls }; sentinels kept, anonymized on display/copy/save
+let publicLog = true;  // anonymize the log (default on; toggled by the Public Log checkbox)
+let diag = false;      // verbose diagnostic logging (default off)
+// One central redaction filter; display/copy/save all pass through anonymize().
+function redact(text) {
+  let s = String(text);
+  if (dev && dev.id) s = s.split(dev.id).join('[redacted-id]');
+  s = s.replace(/\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b/g, '[redacted-mac]');   // MAC
+  s = s.replace(/\b(secret|token|key|aes|pwd|password|pin|mac|serial|vin|uid|imei)\b(\s*[:=]\s*)("?)([^\s",]+)\3/gi,
+    (m, k, sep) => k + sep + '[redacted]');
+  s = s.replace(/\b[0-9A-Fa-f]{16,}\b/g, '[redacted-hex]');   // long hex runs (ids/serials/keys)
+  return s;
+}
+// Unconditional secret scrubber. Runs at the log source (before the buffer), so a bearer token,
+// password or one-time code can never reach the buffer, the display, the copy or the saved file -
+// regardless of the Public Log or diagnostics checkboxes. Keep this independent of publicLog.
+function maskSecrets(text) {
+  let s = String(text);
+  s = s.replace(/eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, '[redacted-jwt]');   // JWT
+  s = s.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer ***');                                   // bearer header value
+  s = s.replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|jwt|password|passwd|pwd|secret|code|otp)\b(\s*[:=]\s*)("?)([^\s",}]+)\3/gi,
+    (m, k, sep) => k + sep + '***');                                                                 // secret key=value
+  return s;
+}
+// Sentinel-marked spans (\x01..\x01, e.g. device name) become XX; then generic redaction - public only.
+function anonymize(s) {
+  if (!publicLog) return String(s).replace(/\x01/g, '');
+  return redact(String(s).replace(/\x01[^\x01]*\x01/g, 'XX').replace(/\x01/g, ''));
+}
+function logLine(cls, text) {
+  const safe = '[' + new Date().toTimeString().slice(0, 8) + '] ' + maskSecrets(text);   // local [HH:MM:SS] + scrub secrets before anything is stored or shown
+  logBuffer.push({ raw: safe, cls: cls });
+  const el = $('log'); if (!el) return;
+  const span = document.createElement('span');
+  if (cls) span.className = cls; span.textContent = anonymize(safe) + '\n';
+  el.appendChild(span); el.scrollTop = el.scrollHeight;
+}
+// Re-render the whole pane (after the Public Log toggle flips).
+function renderLog() {
+  const el = $('log'); if (!el) return;
+  el.textContent = '';
+  for (const e of logBuffer) { const span = document.createElement('span'); if (e.cls) span.className = e.cls; span.textContent = anonymize(e.raw) + '\n'; el.appendChild(span); }
+  el.scrollTop = el.scrollHeight;
+}
+function logText() { return logBuffer.map(e => anonymize(e.raw)).join('\n'); }
+function saveLog() {
+  try {
+    const blob = new Blob([logText()], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'laufbursche42-egret-log.txt';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    logSys('log saved');
+  } catch (e) { logErr('save failed: ' + (e && e.message ? e.message : e)); }
+}
+const logTx = (u, b) => logLine('log-tx', '>>> ' + short(u) + ' | ' + hex(b));
+const logRx = (u, b) => logLine('log-rx', '<<< ' + short(u) + ' | ' + hex(b));
+const logSys = (t) => logLine('', '--- ' + t);
+const logErr = (t) => logLine('log-err', '!!! ' + t);
+const logDiag = (t) => { if (diag) logLine('', '... ' + t); };   // verbose, only when diagnostics on
+function setTile(id, val) { const el = $(id); if (el) el.textContent = (val == null ? '-' : val); }
+function resetTiles() { ['t-speed','t-batt','t-mode','t-lock','t-light','t-range','t-volt','t-current','t-power','t-throttle','t-odo','t-trip','t-temp','t-rpm','t-rangefactor','t-poweredon','t-tempstate','t-charge','t-err','t-fw','t-serial','t-batttemp','t-cycles','t-capacity','t-battfw'].forEach(id => setTile(id, null)); }
+// Big-endian unsigned 24-bit read, used for the odometer fields.
+function uInt24(b, i) { return (b[i] << 16) | (b[i + 1] << 8) | b[i + 2]; }
+const asciiOf = (b) => b.filter(x => x >= 32 && x < 127).map(x => String.fromCharCode(x)).join('');
+function transportDesc(c) {
+  if (!c) return 'auto detect';
+  if (c.fam === 'modern') return 'modern, vendor GATT services, no crypto, speed ' + (c.speed ? 'yes' : 'no') + (c.note === 'unit' ? ', serial class unconfirmed' : '');
+  return 'EY, Nordic UART, CRC16+scramble, ' + (c.xmode ? 'x-mode yes' : 'gears only');
+}
+function logDiagnosticHeader() {
+  logLine('', '=== eg-unlock diagnostic ===');
+  logLine('', 'build: ' + BUILD);
+  logLine('', 'time: ' + new Date().toISOString());
+  logLine('', 'userAgent: ' + (navigator.userAgent || '?'));
+  logLine('', 'platform: ' + (navigator.platform || '?'));
+  logLine('', 'webBluetooth: ' + (navigator.bluetooth ? 'yes' : 'no'));
+  logLine('', 'protocol self-test: ' + (eyOk ? 'OK' : 'FAILED'));
+  logLine('', '================================');
+}
+
+// --------------------------- i18n ---------------------------
+let lang = 'de';
+function table() { return (window.I18N && window.I18N[lang]) || {}; }
+function t(key) { const v = table()[key]; return (typeof v === 'string') ? v : ''; }
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-t]').forEach(n => {
+    const v = t(n.getAttribute('data-t'));
+    if (/[<&]/.test(v)) n.innerHTML = v; else n.textContent = v;   // scan-ok: our own translation table
+  });
+  document.querySelectorAll('[data-t-ph]').forEach(n => { const v = t(n.getAttribute('data-t-ph')); if (v) n.setAttribute('placeholder', v); });
+  { const el = $('link-guide'); if (el) el.href = docFile('GUIDE'); }
+  { const el = $('link-readme'); if (el) el.href = docFile('README'); }
+  { const el = $('link-license'); if (el) el.href = docFile('LICENSE'); }
+  { const el = $('link-privacy'); if (el) el.href = docFile('PRIVACY'); }
+  { const el = $('link-trademarks'); if (el) el.href = docFile('TRADEMARKS'); }
+  { const el = $('link-disclaimer'); if (el) el.href = docFile('DISCLAIMER'); }
+  { const el = $('langs'); if (el) el.setAttribute('aria-label', t('langGroup')); }
+  { const el = $('build-ver'); if (el) el.textContent = t('buildLabel') + ' ' + BUILD; }
+  document.querySelectorAll('#langs button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.lang === lang)));
+  buildModelDropdown();
+  updateSpeedUI();
+  { const el = $('status'); setStatus(el ? el.dataset.state : 'disconnected'); }
+  { const dark = document.documentElement.getAttribute('data-theme') !== 'light';
+    const el = $('btn-theme'); if (el) { el.setAttribute('aria-label', t(dark ? 'themeToLight' : 'themeToDark')); el.title = el.getAttribute('aria-label'); } }
+}
+function initLangSwitch() {
+  document.querySelectorAll('#langs button').forEach(b => b.addEventListener('click', () => { lang = b.dataset.lang; applyLang(); }));
+}
+
+// --------------------------- theme ---------------------------
+function applyTheme(dark) {
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const b = $('btn-theme');
+  if (b) { b.textContent = dark ? '\u2600' : '\u263E'; b.setAttribute('aria-label', t(dark ? 'themeToLight' : 'themeToDark')); b.title = b.getAttribute('aria-label'); }
+  try { localStorage.setItem(LS.THEME, dark ? 'dark' : 'light'); } catch (e) {}
+}
+function initTheme() {
+  let saved = null; try { saved = localStorage.getItem(LS.THEME); } catch (e) {}
+  applyTheme(saved !== 'light');
+  const b = $('btn-theme');
+  if (b) b.addEventListener('click', () => applyTheme(document.documentElement.getAttribute('data-theme') === 'light'));
+}
+
+// --------------------------- model dropdown and per-model gating ---------------------------
+function buildModelDropdown() {
+  const sel = $('model-in'); if (!sel) return;
+  const prev = sel.value || model;
+  sel.textContent = '';
+  const auto = document.createElement('option');
+  auto.value = 'auto'; auto.textContent = t('modelAuto'); sel.appendChild(auto);
+  for (const key of Object.keys(MODELS)) {
+    const o = document.createElement('option');
+    o.value = key; o.textContent = MODELS[key].label; sel.appendChild(o);
+  }
+  sel.value = prev && (prev === 'auto' || MODELS[prev]) ? prev : 'auto';
+}
+function setModel(key, persist) {
+  model = (key === 'auto' || MODELS[key]) ? key : 'auto';
+  const sel = $('model-in'); if (sel) sel.value = model;
+  if (persist !== false) { try { localStorage.setItem(LS.MODEL, model); } catch (e) {} }
+  applyModelUI();
+}
+function show(id, on) { const el = $(id); if (el) el.hidden = !on; }
+function applyModelUI() {
+  const c = cap();
+  const isModern = c && c.fam === 'modern';
+  const isEy = c && c.fam === 'ey';
+  // Connection-gated cards: nothing device-facing shows until connected (header, getting-started,
+  // model+connect and the log stay visible; those are not toggled here). Canonical shell card ids.
+  show('live-card', connected);
+  show('batt-card', connected);
+  show('more-card', connected);
+  show('raw-card', connected);
+  show('card-fw', connected);
+  show('card-immob', connected);
+  // Family-specific groups inside the settings card (also connection-gated)
+  show('card-speed', connected && isModern && c.speed);
+  show('card-ey', connected && isEy);
+  show('card-mode', connected && isModern);
+  // More-settings rows
+  show('row-bright', isModern && !!c.bright);
+  show('row-headlight', isModern && !!c.headlight);
+  show('row-reset', isModern && !!c.reset);
+  ['row-lang', 'row-alwayson', 'row-tempwarn', 'row-range', 'row-unlockreq', 'row-unlockcode', 'row-text', 'row-custname'].forEach(id => show(id, isModern));
+  show('row-cruise', isEy);
+  // EY gear list and X-mode note
+  if (isEy) buildGearList(!!c.xmode);
+  const nx = $('ey-noxmode'); if (nx) nx.hidden = !(isEy && !c.xmode);
+}
+function buildGearList(withX) {
+  const sel = $('gear-in'); if (!sel) return;
+  sel.textContent = '';
+  if (withX) {
+    for (const [v, k] of [['x', 'gearX'], ['x3', 'gearX3']]) {
+      const o = document.createElement('option'); o.value = v; o.textContent = t(k); o.setAttribute('data-t', k); sel.appendChild(o);
+    }
+  }
+  for (let g = 0; g <= 7; g++) { const o = document.createElement('option'); o.value = String(g); o.textContent = t('gearPrefix') + g; sel.appendChild(o); }
+}
+
+// --------------------------- status ---------------------------
+function statusLabel(s) {
+  const map = { disconnected: 'stDisconnected', connecting: 'stConnecting', linking: 'stLinking', connected: 'stConnected', 'no-service': 'stNoService', 'no-char': 'stNoChar' };
+  return t(map[s] || 'stDisconnected') || s;
+}
+function setStatus(s) {
+  const el = $('status'); if (el) { el.dataset.state = s; el.textContent = statusLabel(s); }
+  const cb = $('btn-conn');
+  if (cb) { const on = (s === 'connecting' || s === 'linking' || s === 'connected'); cb.textContent = on ? t('btnDisconnect') : t('btnConnect'); cb.dataset.act = on ? 'disconnect' : 'connect'; }
+}
+function setControlsEnabled(on) {
+  ['btn-toggle','btn-gear','gear-in','btn-mode','mode-in','btn-bright','bright-in','btn-headlight','headlight-in',
+   'btn-light','light-in','btn-unit','unit-in','btn-reset-trip','btn-reset-total','btn-immob-lock','btn-immob-unlock',
+   'btn-lang','lang-in','btn-alwayson','alwayson-in','btn-tempwarn','tempwarn-in','btn-range','range-in',
+   'btn-unlockreq','unlockreq-in','btn-unlockcode','unlockcode-in','btn-text','text-in','btn-custname','custname-in','btn-cruise','cruise-in']
+    .forEach(id => { const e = $(id); if (e) e.disabled = !on; });
+}
+
+// --------------------------- connect ---------------------------
+async function connect() {
+  if (!navigator.bluetooth) { logErr('This browser has no Web Bluetooth. Use Chrome, Edge or Bluefy.'); return; }
+  try {
+    setStatus('connecting');
+    const wantEy = fam() === 'ey';
+    let opts;
+    if (wantEy) opts = { filters: [{ namePrefix: 'EY' }, { namePrefix: 'YD' }, { services: [U.EY_SVC] }], optionalServices: [U.EY_SVC] };
+    else if (fam() === 'modern') opts = { filters: [{ namePrefix: 'EGRET' }, { namePrefix: 'Egret' }, { services: [U.ID_SVC] }, { services: [U.OP_SVC] }], optionalServices: MODERN_OPT_SVCS };
+    else opts = { filters: [{ namePrefix: 'EGRET' }, { namePrefix: 'Egret' }, { namePrefix: 'EY' }, { namePrefix: 'YD' }, { services: [U.ID_SVC] }, { services: [U.EY_SVC] }], optionalServices: MODERN_OPT_SVCS.concat([U.EY_SVC]) };
+    dev = await navigator.bluetooth.requestDevice(opts);
+    dev.addEventListener('gattserverdisconnected', onDisconnected);
+    logSys('device: \x01' + (dev.name || '(no name)') + '\x01');   // name masked when Public Log is on
+    if (model === 'auto') autoDetect(dev.name || '');
+    setStatus('linking');
+    server = await dev.gatt.connect();
+    await discover();
+    setStatus('connected');
+    connected = true;
+    setControlsEnabled(true);
+    applyModelUI();   // reveal the cards applicable to the (auto-detected) model
+    updateSpeedUI();
+    { const el = $('devinfo'); if (el) el.textContent = t('devPrefix') + ' ' + (dev.name || 'Egret'); }
+    logSys('connected, ' + Object.keys(chars).length + ' characteristics');
+    if (fam() === 'ey') await startEy(); else await startModern();
+  } catch (e) {
+    logErr('connect failed: ' + (e && e.message ? e.message : e));
+    connected = false;
+    setStatus('disconnected');
+    applyModelUI();
+  }
+}
+function autoDetect(name) {
+  const up = name.toUpperCase();
+  if (up.startsWith('EY') || up.startsWith('YD')) { setModel('EY1', false); logSys('auto: EY family (exact EY type not in advertised name, using EY1 defaults)'); return; }
+  let best = null;
+  for (const key of MODERN_KEYS) { for (const n of MODELS[key].names) { if (up.startsWith(n.toUpperCase())) { if (!best || n.length > best.n) best = { key, n: n.length }; } } }
+  if (best) { setModel(best.key, false); logSys('auto: ' + MODELS[best.key].label); }
+  else logSys('auto: unknown name, keeping generic modern');
+}
+async function discover() {
+  chars = {};
+  const svcs = await server.getPrimaryServices();
+  logDiag('GATT primary services found: ' + svcs.length);
+  for (const s of svcs) {
+    logDiag('SERVICE ' + s.uuid);
+    let cs;
+    try {
+      cs = await s.getCharacteristics();
+    } catch (e) {
+      logDiag('  characteristics unavailable: ' + (e && e.message ? e.message : String(e)));
+      continue;
+    }
+    for (const c of cs) {
+      // Web Bluetooth implementations may expose UUIDs with different casing.
+      // Store canonical lowercase keys so lookups match our constants.
+      chars[String(c.uuid).toLowerCase()] = c;
+      const p = c.properties;
+      const flags = [
+        p.read ? 'READ' : '',
+        p.write ? 'WRITE' : '',
+        p.writeWithoutResponse ? 'WRITE_NO_RESPONSE' : '',
+        p.notify ? 'NOTIFY' : '',
+        p.indicate ? 'INDICATE' : ''
+      ].filter(Boolean).join(',');
+      logDiag('  CHAR ' + c.uuid + ' [' + (flags || 'no standard properties') + ']');
+    }
+  }
+  logDiag('EY target service ' + U.EY_SVC + ': ' +
+    (svcs.some(s => String(s.uuid).toLowerCase() === U.EY_SVC.toLowerCase()) ? 'FOUND' : 'NOT FOUND'));
+  for (const uuid of [U.EY_WR, U.EY_NO]) {
+    const c = chars[String(uuid).toLowerCase()];
+    logDiag('EY target characteristic ' + uuid + ': ' +
+      (c ? 'FOUND [' + [
+        c.properties.read ? 'READ' : '',
+        c.properties.write ? 'WRITE' : '',
+        c.properties.writeWithoutResponse ? 'WRITE_NO_RESPONSE' : '',
+        c.properties.notify ? 'NOTIFY' : '',
+        c.properties.indicate ? 'INDICATE' : ''
+      ].filter(Boolean).join(',') + ']' : 'NOT FOUND'));
+  }
+}
+function onDisconnected() { connected = false; setStatus('disconnected'); setControlsEnabled(false); applyModelUI(); resetTiles(); curSpeedLimit = null; updateSpeedUI(); const el = $('devinfo'); if (el) el.textContent = ''; logSys('disconnected'); }
+function disconnect() { if (dev && dev.gatt.connected) dev.gatt.disconnect(); }
+
+// --------------------------- modern telemetry + commands ---------------------------
+const MODE_NAMES = ['Off/6', 'Eco', 'Tour', 'Sport', 'Pedestrian', 'DMode', 'SMode', 'XMode', 'Neutral'];
+async function startModern() {
+  await subscribe(U.OP_STAT, parseOpStatus);
+  await subscribe(U.BAT_LVL, b => { if (b.length) setTile('t-batt', b[0] + ' %'); });
+  await subscribe(U.BAT_STD, b => { if (b.length) setTile('t-batt', b[0] + ' %'); });
+  await subscribe(U.DIA_STAT, parseDiag);
+  await subscribe(U.OP_ODO, parseOdo);
+  await subscribe(U.SET_STAT, parseSettings);
+  await tryRead(U.SET_STAT, parseSettings);
+  await tryRead(U.OP_STAT, parseOpStatus);
+  await tryRead(U.BAT_LVL, b => { if (b.length) setTile('t-batt', b[0] + ' %'); });
+  await tryRead(U.OP_ODO, parseOdo);
+  await tryRead(U.BAT_DIAG, parseBatDiag);
+  await tryRead(U.BAT_INFO, parseBatInfo);
+  await tryRead(U.BAT_FW, b => setTile('t-battfw', asciiOf(b) || '-'));
+  await tryRead(U.DEV_SERIAL, b => setTile('t-serial', asciiOf(b) || '-'));
+  await tryRead(U.DEV_FW, b => setTile('t-fw', asciiOf(b) || '-'));
+}
+function parseOpStatus(b) {
+  if (b.length < 14) return;
+  const f = b[0];
+  setTile('t-poweredon', (f & 1) ? t('valOn') : t('valOff'));   // byte0 bit0 poweredOn (OperationStatus.java:225)
+  setTile('t-lock', (f & 2) ? t('valLocked') : t('valOpen'));
+  setTile('t-light', (f & 4) ? t('valOn') : t('valOff'));
+  setTile('t-charge', (f & 8) ? t('valOn') : t('valOff'));
+  // byte0 bit4/bit5 temperatureLow/temperatureHigh (OperationStatus.java:229-230)
+  setTile('t-tempstate', (f & 32) ? t('twHigh') : ((f & 16) ? t('twLow') : t('valNormal')));
+  setTile('t-speed', (((b[1] << 8) | b[2]) / 10).toFixed(1));
+  setTile('t-power', b[3] + ' %');
+  setTile('t-throttle', b[11] + ' %');
+  setTile('t-rangefactor', b[10] + ' %');   // byte10 rangeFactor (OperationStatus.java:236)
+  const eco = ((b[4] << 8) | b[5]) / 10, tour = ((b[6] << 8) | b[7]) / 10, sport = ((b[8] << 8) | b[9]) / 10;
+  setTile('t-range', Math.max(eco, tour, sport).toFixed(0) + ' km');
+  setTile('t-mode', MODE_NAMES[b[12]] || ('mode ' + b[12]));
+  setTile('t-err', b[13] === 0 ? '-' : ('code ' + b[13]));
+}
+// Motor temperature and motor RPM from the diagnostics status (live, ScooterDiagnostic.java:86).
+function parseDiag(b) {
+  if (b.length >= 2) setTile('t-temp', (((b[0] << 8) | b[1]) / 10).toFixed(1) + ' C');
+  if (b.length >= 4) setTile('t-rpm', (((b[2] << 8) | b[3]) & 0xffff) + ' rpm');   // byte2-3 motorRpm (u16)
+}
+// Odometer: total distance as big-endian 24-bit. The app divides by 10 only for the Unit (proven,
+// decomp.js:844322-844336); other models pass the value through unchanged.
+function parseOdo(b) {
+  if (b.length < 5) return;
+  setTile('t-trip', (((b[0] << 8) | b[1]) / 10).toFixed(1) + ' km');   // byte0-1 tripHectoMeters /10 = km (OdoStatus.java:135)
+  const c = cap();
+  const total = (c && c.note === 'unit') ? uInt24(b, 2) / 10 : uInt24(b, 2);
+  setTile('t-odo', total.toFixed(total < 100 ? 1 : 0) + ' km');
+}
+// Battery diagnostics: temperature, voltage and current (BatteryDiagnostic.java:101).
+function parseBatDiag(b) {
+  if (b.length < 6) return;
+  setTile('t-batttemp', ((((b[0] << 8) | b[1]) - 2740) / 10).toFixed(1) + ' C');   // byte0-1 (u16-2740)/10 (offset BatteryDiagnosticsKt.java:9)
+  setTile('t-volt', (((b[2] << 8) | b[3]) / 10).toFixed(1) + ' V');
+  setTile('t-current', (((b[4] << 8) | b[5]) / 10).toFixed(1) + ' A');
+}
+// Battery info: charge cycles and full-charge capacity (BatteryInfo.java:90).
+function parseBatInfo(b) {
+  if (b.length < 4) return;
+  setTile('t-cycles', ((b[0] << 8) | b[1]) + '');          // byte0-1 chargeCycles (u16)
+  setTile('t-capacity', ((b[2] << 8) | b[3]) + ' mAh');    // byte2-3 fullChargeCapacity (u16 mAh)
+}
+// SETTINGS_STATUS (BCCAE7E2, Settings.fromBytes): byte0 bit2 = speedLimitEnabled, byte11 = speed limit
+// (the byte equals km/h on current firmware). Read live so one button can label itself from device state.
+function parseSettings(b) {
+  if (b.length < 12) return;
+  curSpeedLimit = b[11] & 0xff;
+  updateSpeedUI();
+}
+function updateSpeedUI() {
+  const cur = curSpeedLimit;
+  const info = $('speed-current');
+  if (info) info.textContent = (cur == null) ? t('speedCurUnknown') : (t('speedCurPrefix') + ' ' + cur + ' km/h');
+  const b = $('btn-toggle'); if (!b) return;
+  const ekfv = parseInt(($('ekfv-in') || {}).value, 10) || 20;
+  // Locked = current limit at or below the eKFV value (throttled). Unknown -> offer unlock by default.
+  const locked = (cur == null) ? true : (cur <= ekfv);
+  b.dataset.mode = locked ? 'unlock' : 'lock';
+  b.textContent = locked ? t('btnUnlock') : t('btnLock');
+}
+async function sendSettings(op, payload) { await writeCmd(U.SET_CMD, [op].concat(payload || [])); }
+async function sendOperation(op, payload) { await writeCmd(U.OP_CMD, [op].concat(payload || [])); }
+async function setSpeedLimit(kmh) {
+  // The official app sends only SetSpeedLimit (opcode 8) with the km/h byte. Opcode 7
+  // (SetSpeedLimitEnabled) is a dead constant, never sent, so we do not send it either.
+  await sendSettings(8, [kmh & 0xff]);
+  logSys('speed limit ' + kmh + ' km/h (08 ' + (kmh & 0xff).toString(16).padStart(2, '0').toUpperCase() + ')');
+}
+// Free display text: clear (op 12), send one 18-byte ASCII frame (op 4, frame index 0), show (op 13).
+async function setFreeText(s) {
+  const bytes = Array.from(String(s)).slice(0, 18).map(c => c.charCodeAt(0) & 0x7f);
+  await sendOperation(12, []);
+  await sendOperation(4, [0].concat(bytes));
+  await sendOperation(13, []);
+}
+async function setCustomerName(s) {
+  const bytes = Array.from(String(s)).slice(0, 20).map(c => c.charCodeAt(0) & 0xff);
+  await writeCmd(U.CUST, bytes);
+}
+// Display unlock code: 4 ASCII characters (settings opcode 4).
+async function setUnlockCode(s) {
+  const bytes = Array.from(String(s)).slice(0, 4).map(c => c.charCodeAt(0) & 0x7f);
+  await sendSettings(4, bytes);
+}
+
+// --------------------------- EY telemetry + commands ---------------------------
+let eyBuf = [];
+async function startEy() {
+  eyBuf = [];
+  await subscribe(U.EY_NO, onEyNotify);
+  await eySend(0x23, 0x02, [0x40, 0x40], 'queryBasicData');
+}
+function onEyNotify(bytes) {
+  for (const x of bytes) eyBuf.push(x);
+  while (eyBuf.length >= 7) {
+    if (eyBuf[0] !== 0x5A) { eyBuf.shift(); continue; }
+    const total = eyBuf[4] + 7;
+    if (eyBuf.length < total) break;
+    decodeEy(eyBuf.slice(0, total)); eyBuf = eyBuf.slice(total);
+  }
+}
+function decodeEy(frame) {
+  const func = frame[2], data = frame.slice(5, 5 + frame[4]);
+  if (func === 0x01 && data.length >= 6) {
+    setTile('t-batt', data[0] + ' %');
+    setTile('t-speed', (((data[1] << 7) | data[2]) / 10).toFixed(1));
+    setTile('t-mode', t('gearPrefix') + (data[3] & 7));   // EY drivingMode = gear int (EyBasicData.java:145), not the modern ride-mode enum
+
+    setTile('t-lock', (data[5] & 0x20) ? t('valLocked') : t('valOpen'));
+    setTile('t-light', (data[5] & 0x08) ? t('valOn') : t('valOff'));
+  }
+}
+function eyCrc16(bytes) {
+  let crc = 0;
+  for (const bb of bytes) {
+    let x = (((crc << 8) | (crc >>> 8)) ^ (bb & 0xff)) & 0xffff;
+    x = (x ^ ((x & 0xff) >>> 4)) & 0xffff;
+    x = (x ^ ((x << 12) & 0xffff)) & 0xffff;
+    x = (x ^ ((x & 0xff) << 5)) & 0xffff;
+    crc = x & 0xffff;
+  }
+  return crc;
+}
+const eyScramble = (bytes) => bytes.map((v, i) => (v ^ (i + 10)) & 0xff);
+function eyFrame(addr, func, data) {
+  const head = [0x5A, addr, func, func, data.length].concat(data);
+  const crc = eyCrc16(head);
+  return eyScramble(head.concat([(crc >>> 8) & 0xff, crc & 0xff]));
+}
+async function eySend(addr, func, data, label) {
+  const c = chars[U.EY_WR.toLowerCase()]; if (!c) { logErr('EY write characteristic missing'); return; }
+  await writeChar(c, Uint8Array.from(eyFrame(addr, func, data)));
+  logSys('EY ' + label);
+}
+function eySelfTest() {
+  const cases = [
+    ['unlock',  eyFrame(0x23, 0x02, [0x00, 0x01]), [0x50,0x28,0x0E,0x0F,0x0C,0x0F,0x11,0x24,0x89]],
+    ['gear0',   eyFrame(0x23, 0x05, [0xA0, 0x00]), [0x50,0x28,0x09,0x08,0x0C,0xAF,0x10,0x1F,0x2F]],
+    ['xmode',   eyFrame(0x23, 0x05, [0x80, 0x00]), [0x50,0x28,0x09,0x08,0x0C,0x8F,0x10,0x19,0xC9]]
+  ];
+  let ok = true;
+  for (const [n, got, exp] of cases) if (got.length !== exp.length || got.some((v, i) => v !== exp[i])) { ok = false; }
+  return ok;   // result is reported via the diagnostic header's "protocol self-test:" line
+}
+let eyOk = true;
+async function eyGear(sel) {
+  if (!eyOk) { logErr('EY self-test failed, commands disabled'); return; }
+  if (sel === 'x') return eySend(0x23, 0x05, [0x80, 0x00], 'X-mode');
+  if (sel === 'x3') return eySend(0x23, 0x05, [0xA3, 0x00], 'X-mode gear 3');
+  const g = parseInt(sel, 10) & 7; return eySend(0x23, 0x05, [(0xA0 | g) & 0xff, 0x00], 'gear ' + g);
+}
+
+// --------------------------- GATT primitives ---------------------------
+async function subscribe(uuid, handler) {
+  const c = chars[String(uuid).toLowerCase()]; if (!c) return false;
+  try {
+    await c.startNotifications();
+    logDiag('subscribed ' + short(uuid));
+    c.addEventListener('characteristicvaluechanged', ev => { const b = new Uint8Array(ev.target.value.buffer); logRx(uuid, b); handler(Array.from(b)); });
+    return true;
+  } catch (e) { logErr('notify ' + short(uuid) + ' failed: ' + e.message); return false; }
+}
+async function tryRead(uuid, handler) {
+  const c = chars[String(uuid).toLowerCase()]; if (!c || !c.properties.read) return;
+  logDiag('read ' + short(uuid));
+  try { const v = await c.readValue(); const b = new Uint8Array(v.buffer); logRx(uuid, b); handler(Array.from(b)); } catch (_) {}
+}
+async function writeCmd(uuid, bytes) { const c = chars[String(uuid).toLowerCase()]; if (!c) { logErr('characteristic ' + short(uuid) + ' missing'); return; } await writeChar(c, Uint8Array.from(bytes)); }
+async function writeChar(c, arr) { logTx(c.uuid, arr); if (c.properties.write) await c.writeValueWithResponse(arr); else await c.writeValueWithoutResponse(arr); }
+async function guard(fn) { if (busy) return; busy = true; try { await fn(); } catch (e) { logErr(e && e.message ? e.message : String(e)); } finally { busy = false; } }
+
+// --------------------------- document viewer (markdown of our own docs) ---------------------------
+const DOC_TITLES = {
+  'GUIDE.de.md': 'footGuide', 'GUIDE.en.md': 'footGuide',
+  'PRIVACY.de.md': 'footPrivacy', 'PRIVACY.md': 'footPrivacy',
+  'LICENSE.de.md': 'footLicense', 'LICENSE.md': 'footLicense',
+  'TRADEMARKS.de.md': 'footTrademarks', 'TRADEMARKS.md': 'footTrademarks',
+  'README.md': 'footReadme'
+};
+const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const slug = s => s.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/ /g, '-');
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+// inlineMd receives ALREADY-escaped text (mdToHtml escapes first); DOC_TITLES hrefs stay in-modal.
+function inlineMd(s) {
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (m, text, href) {
+      if (DOC_TITLES[href]) return '<a href="' + href + '" data-docfile="' + href + '">' + text + '</a>';
+      return '<a href="' + href + '" target="_blank" rel="noopener">' + text + '</a>';
+    });
+}
+function mdToHtml(md) {
+  var codeBlocks = [];
+  // 1) pull fenced code blocks out first so their content is never treated as markdown
+  md = String(md).replace(/```[^\n]*\n?([\s\S]*?)```/g, function (m, code) {
+    var i = codeBlocks.length;
+    codeBlocks.push('<pre><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\x00CB' + i + '\x00';
+  });
+  var lines = md.split(/\r?\n/);
+  var out = [], para = [], list = null;
+  function flushPara() { if (para.length) { out.push('<p>' + inlineMd(esc(para.join(' '))) + '</p>'); para = []; } }
+  function flushList() { if (list) { out.push('<' + list.type + '>' + list.items.join('') + '</' + list.type + '>'); list = null; } }
+  function isTableSep(s) { var tt = s.replace(/\s/g, ''); return /^\|?:?-+:?(\|:?-+:?)+\|?$/.test(tt); }
+  function splitRow(s) { return s.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(function (c) { return c.trim(); }); }
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    var cb = ln.match(/^\x00CB(\d+)\x00$/);
+    if (cb) { flushPara(); flushList(); out.push(codeBlocks[Number(cb[1])]); continue; }
+    if (/^\s*$/.test(ln)) { flushPara(); flushList(); continue; }
+    var h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushPara(); flushList(); var lvl = Math.min(h[1].length, 4); out.push('<h' + lvl + '>' + inlineMd(esc(h[2])) + '</h' + lvl + '>'); continue; }
+    if (/^---+$/.test(ln.trim())) { flushPara(); flushList(); out.push('<hr>'); continue; }
+    if (ln.indexOf('|') >= 0 && i + 1 < lines.length && isTableSep(lines[i + 1])) {   // GFM table: header, |---| sep, rows
+      flushPara(); flushList();
+      var head = splitRow(ln); i++;   // consume the separator row
+      var body = '';
+      while (i + 1 < lines.length && lines[i + 1].indexOf('|') >= 0 && lines[i + 1].trim() !== '') {
+        body += '<tr>' + splitRow(lines[++i]).map(function (c) { return '<td>' + inlineMd(esc(c)) + '</td>'; }).join('') + '</tr>';
+      }
+      out.push('<table><thead><tr>' + head.map(function (c) { return '<th>' + inlineMd(esc(c)) + '</th>'; }).join('') + '</tr></thead><tbody>' + body + '</tbody></table>');
+      continue;
+    }
+    if (/^\s*>/.test(ln)) {                             // merge consecutive > lines into ONE callout
+      flushPara(); flushList();
+      var q = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      i--;                                              // step back; the for-loop re-increments
+      while (q.length && /^\s*$/.test(q[0])) q.shift();
+      while (q.length && /^\s*$/.test(q[q.length - 1])) q.pop();
+      if (q.length) out.push('<blockquote>' + mdToHtml(q.join('\n')) + '</blockquote>');  // inner rendered as markdown
+      continue;
+    }
+    var ul = ln.match(/^\s*[-*]\s+(.*)$/);
+    var ol = ln.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      var type = ul ? 'ul' : 'ol';
+      if (!list || list.type !== type) { flushList(); list = { type: type, items: [] }; }
+      list.items.push('<li>' + inlineMd(esc((ul ? ul[1] : ol[1]))) + '</li>');
+      continue;
+    }
+    para.push(ln.trim());
+  }
+  flushPara(); flushList();
+  return out.join('\n');
+}
+const docCache = {};
+const docFile = name => { if (name === 'GUIDE') return 'GUIDE.' + lang + '.md'; if (name === 'README') return 'README.md'; return lang === 'de' ? name + '.de.md' : name + '.md'; };
+function openDocFile(file, titleKey) {
+  const dlg = $('doc'), body = $('doc-body'); if (!dlg || !body) return;
+  const mark = (lang === 'de' && !file.includes('.de.') && file !== 'README.md') ? ' ' + t('docEnglish') : '';
+  $('doc-title').textContent = (t(titleKey || DOC_TITLES[file] || '') || file) + mark;
+  if (typeof dlg.showModal === 'function') dlg.showModal();
+  const showDoc = html => { body.innerHTML = html; const h1 = body.querySelector('h1'); if (h1) { $('doc-title').textContent = h1.textContent.trim() + mark; h1.remove(); } body.scrollTop = 0; }; // scan-ok: markdown of our own documents, escaped by mdToHtml first
+  if (docCache[file]) { showDoc(docCache[file]); return; }
+  body.innerHTML = '<p>' + escHtml(t('docLoading')) + '</p>'; // scan-ok: escaped
+  fetch(file + '?v=' + BUILD).then(r => { if (!r.ok) throw new Error(r.status + ' ' + r.statusText); return r.text(); })
+    .then(txt => { docCache[file] = mdToHtml(txt); showDoc(docCache[file]); })
+    .catch(e => { body.innerHTML = '<p>' + escHtml(t('docFail')) + '</p><pre class="log-err">' + escHtml(file + ': ' + (e && e.message ? e.message : e)) + '</pre>'; }); // scan-ok: escaped
+}
+function wireDocViewer() {
+  document.addEventListener('click', e => {
+    if (!e.target.closest) return;
+    const disc = e.target.closest('[data-open-disclaimer]'); if (disc) { e.preventDefault(); openDocFile(docFile('DISCLAIMER'), 'footDisclaimer'); return; }
+    const a = e.target.closest('[data-doc], [data-docfile]'); if (!a) return;
+    e.preventDefault();
+    const file = a.getAttribute('data-docfile');
+    if (file) openDocFile(file, a.getAttribute('data-t') || '');
+    else openDocFile(docFile(a.getAttribute('data-doc')), a.getAttribute('data-t') || '');
+  });
+  ['doc-x', 'doc-close'].forEach(id => { const b = $(id); if (b) b.addEventListener('click', () => { const d = $('doc'); if (d) d.close(); }); });
+}
+
+// --------------------------- help ---------------------------
+const HELP = { batt: ['help_batt_t', 'help_batt_b'], speed: ['s3Title', 'speedValuesHint'], ey: ['eyTitle', 'eyGearHint'], mode: ['modeTitle', 'modeHint'], more: ['moreTitle', 'moreHint'], immob: ['immobTitle', 'immobHint'], firmware: ['fwTitleHelp', 'fwHelpHtml'], publiclog: ['publicLogTitle', 'publicLogHelpHtml'], diaglog: ['diagLogTitle', 'diagLogHelpHtml'] };
+function openHelp(key) {
+  const m = HELP[key]; if (!m) return; const dlg = $('help'); if (!dlg) return;
+  $('help-title').textContent = t(m[0]);
+  const bo = $('help-body'); if (bo) { const v = t(m[1]); if (/[<&]/.test(v)) bo.innerHTML = v; else bo.textContent = v; } // scan-ok: our own translation table
+  if (dlg.showModal) { try { dlg.showModal(); } catch (e) { dlg.setAttribute('open', ''); } } else dlg.setAttribute('open', '');
+}
+function closeHelp() { const dlg = $('help'); if (dlg && dlg.close) dlg.close(); }
+
+// --------------------------- firmware via the Egret account (cloud) ---------------------------
+// This is the only part of the page that leaves the device: it talks to the manufacturer API with the
+// user's own account, like the app. CORS is open (ACAO *), live-verified 2026-10-01. Endpoints and the
+// login response shape are only partially documented, so requests are built defensively and failures
+// are surfaced in the log. Secrets (token, password, code) never enter the log - see maskSecrets.
+const FW_API = 'https://api.my-egret.com';
+const FW_TARGET_PATH = { controller: 'controller-check', display: 'display-check', bluetooth: 'bluetooth-check', bms: 'bms-check' };
+let fwToken = null;     // access token, in memory only (never stored, never logged)
+let fwRefresh = null;   // refresh token, in memory only
+
+function fwAuthHeaders() { return fwToken ? { Authorization: 'Bearer ' + fwToken } : {}; }
+function stripQuery(u) { try { const x = new URL(u); return x.origin + x.pathname; } catch (_) { return String(u).split('?')[0]; } }
+
+// Defensive token extraction: the field names are not firmly documented, so try the common shapes.
+function fwExtractTokens(j) {
+  if (!j || typeof j !== 'object') return false;
+  const nest = (j.data && typeof j.data === 'object') ? j.data : ((j.tokens && typeof j.tokens === 'object') ? j.tokens : null);
+  const pick = (o, keys) => { if (!o) return null; for (const k of keys) { if (typeof o[k] === 'string' && o[k]) return o[k]; } return null; };
+  const accKeys = ['accessToken', 'access_token', 'token', 'jwt', 'idToken', 'id_token'];
+  const refKeys = ['refreshToken', 'refresh_token'];
+  const acc = pick(j, accKeys) || pick(nest, accKeys);
+  const ref = pick(j, refKeys) || pick(nest, refKeys);
+  if (acc) { fwToken = acc; fwRefresh = ref || null; return true; }
+  return false;
+}
+
+// One central request wrapper. Logs method+path and status (normal), failures via logErr, and response
+// keys plus the download source to the diagnostic log only. Bodies are never logged (they may hold secrets).
+async function fwFetch(method, path, body, withAuth) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (withAuth) Object.assign(headers, fwAuthHeaders());
+  logSys('firmware: ' + method + ' ' + path + (withAuth ? ' (auth)' : ''));
+  let res;
+  try {
+    res = await fetch(FW_API + path, { method: method, headers: headers, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) {
+    logErr('firmware: ' + method + ' ' + path + ' network/CORS error: ' + (e && e.message ? e.message : e));
+    throw e;
+  }
+  let data = null;
+  try { const txt = await res.text(); data = txt ? JSON.parse(txt) : null; } catch (_) { data = null; }
+  if (!res.ok) {
+    const extra = (data && (data.message || data.error)) ? ' (' + (data.message || data.error) + ')' : '';
+    logErr('firmware: ' + method + ' ' + path + ' -> HTTP ' + res.status + ' ' + res.statusText + extra);
+  } else {
+    logSys('firmware: ' + method + ' ' + path + ' -> HTTP ' + res.status);
+    if (data && typeof data === 'object') logDiag('firmware: response keys: ' + Object.keys(data).join(', '));
+  }
+  return { ok: res.ok, status: res.status, data: data };
+}
+
+function fwSetSession(on) {
+  show('fw-login', !on);
+  show('fw-session', on);
+  const s = $('fw-status'); if (s) s.textContent = on ? t('fwLoggedIn') : '';
+  if (on) {
+    const c = cap(); const mi = $('fw-model');
+    if (mi && !mi.value && c && c.fam === 'modern') mi.value = c.label.replace(/^Egret\s+/i, '');
+    const fwTile = $('t-fw'); const vi = $('fw-version');
+    if (vi && !vi.value && fwTile && fwTile.textContent && fwTile.textContent !== '-') vi.value = fwTile.textContent;
+    // After login, always load everything: the full list plus each of the four control units (forced
+    // with version 0 so a download always comes back). Deferred so it runs after the login guard
+    // releases its busy lock.
+    logSys('firmware: loading all firmware (list plus each unit)');
+    setTimeout(() => guard(fwLoadAll), 0);
+  }
+}
+
+// The Egret account login is magic-link only, exactly as the app does it (no e-mail/password route on
+// this API). Flow belegt from decomp.js: POST auth/magic {email} ?lang -> mail with a link; then
+// GET auth/magic/<token> -> {user, token, refreshToken}.
+async function fwMagicRequest() {
+  const email = (($('fw-email') || {}).value || '').trim();
+  if (!email) { logErr('firmware: enter your e-mail first'); return; }
+  const lang = (document.documentElement.getAttribute('lang') || 'de').slice(0, 2);
+  const r = await fwFetch('POST', '/auth/magic?lang=' + encodeURIComponent(lang), { email: email }, false);
+  if (r.ok) logSys('firmware: magic link requested, open the mail from Egret and paste the link below');
+}
+
+// Pull the magic token out of whatever the user pastes: the full link, a deep link or the raw token.
+function fwExtractMagicToken(raw) {
+  let s = String(raw || '').trim();
+  const m = s.match(/auth\/magic\/([^/?#\s]+)/i);
+  if (m) return m[1];
+  if (s.indexOf('/') >= 0) { const seg = s.split(/[?#]/)[0].split('/').filter(Boolean); return seg[seg.length - 1] || ''; }
+  return s;
+}
+
+async function fwMagicVerify() {
+  const tok = fwExtractMagicToken(($('fw-code') || {}).value);
+  if (!tok) { logErr('firmware: paste the magic link or token from the mail first'); return; }
+  const r = await fwFetch('GET', '/auth/magic/' + encodeURIComponent(tok), null, false);
+  if (r.ok && fwExtractTokens(r.data)) { logSys('firmware: magic login ok, token received'); fwSetSession(true); }
+  else if (r.ok) { logErr('firmware: magic verify returned no token (check the diagnostic log for the response keys)'); }
+}
+
+function fwLogout() {
+  fwToken = null; fwRefresh = null;
+  const c = $('fw-code'); if (c) c.value = '';
+  const res = $('fw-results'); if (res) res.textContent = '';
+  fwSetSession(false);
+  logSys('firmware: signed out, token cleared');
+}
+
+// Render one firmware entry. `source` ('list' or 'check') is shown so you can tell where it came from
+// when the same firmware appears from both.
+function fwRenderEntry(container, item, source) {
+  if (!item || typeof item !== 'object') return;
+  const target = item.updateTarget != null ? String(item.updateTarget) : (item.target != null ? String(item.target) : '?');
+  const version = item.newVersion || item.version || '?';
+  const dl = item.download || item.url || item.downloadUrl || '';
+  const src = source === 'check' ? t('fwSrcCheck') : (source === 'list' ? t('fwSrcList') : '');
+  const row = document.createElement('div'); row.className = 'set-row';
+  const label = document.createElement('label');
+  label.textContent = target + ' - ' + t('fwResultVersion') + ' ' + version +
+    (item.updateAvailable != null ? ' (' + (item.updateAvailable ? t('fwUpdateYes') : t('fwUpdateNo')) + ')' : '') +
+    (src ? ' [' + src + ']' : '');
+  row.appendChild(label);
+  if (dl) {
+    const b = document.createElement('button'); b.textContent = t('fwBtnDownload');
+    b.addEventListener('click', () => guard(() => fwDownload(dl, target, version)));
+    row.appendChild(b);
+  } else {
+    const s = document.createElement('small'); s.textContent = t('fwNoDownload'); row.appendChild(s);
+  }
+  container.appendChild(row);
+}
+
+async function fwList(keep) {
+  const cont = $('fw-results'); if (cont && !keep) cont.textContent = '';
+  const r = await fwFetch('GET', '/firmware/list', null, true);
+  if (!r.ok || !cont) return 0;
+  const d = r.data;
+  const items = Array.isArray(d) ? d
+    : (d && Array.isArray(d.data) ? d.data
+      : (d && Array.isArray(d.firmware) ? d.firmware
+        : (d && Array.isArray(d.list) ? d.list
+          : (d && typeof d === 'object' ? [d] : []))));
+  for (const it of items) fwRenderEntry(cont, it, 'list');
+  if (!keep && !items.length) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = t('fwNoResults'); cont.appendChild(p); }
+  return items.length;
+}
+
+// versionOverride '0' makes the server return the latest firmware with a download even when the scooter
+// is already up to date (the app itself does this in one branch, decomp.js:890945-890957).
+async function fwCheck(targetArg, keep, versionOverride) {
+  const cont = $('fw-results'); if (cont && !keep) cont.textContent = '';
+  const target = (typeof targetArg === 'string' && targetArg) ? targetArg : (($('fw-target') || {}).value || 'controller');
+  const model = encodeURIComponent(($('fw-model') || {}).value || '');
+  const version = encodeURIComponent(versionOverride != null ? versionOverride : (($('fw-version') || {}).value || ''));
+  const path = '/firmware/' + (FW_TARGET_PATH[target] || 'controller-check') + '?model=' + model + '&version=' + version;
+  const r = await fwFetch('GET', path, null, true);
+  if (!r.ok || !cont) return 0;
+  if (r.data && typeof r.data === 'object') { fwRenderEntry(cont, Object.assign({ updateTarget: target }, r.data), 'check'); return 1; }
+  if (!keep) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = t('fwNoResults'); cont.appendChild(p); }
+  return 0;
+}
+
+// Load everything after login: the combined list plus each of the four control units, so nothing is
+// missed regardless of what the list returns. Renders all hits into one result area.
+async function fwLoadAll() {
+  const cont = $('fw-results'); if (cont) cont.textContent = '';
+  let n = await fwList(true);
+  for (const target of ['controller', 'display', 'bluetooth', 'bms']) n += await fwCheck(target, true, '0');
+  if (cont && !n) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = t('fwNoResults'); cont.appendChild(p); }
+}
+
+function fwTriggerBlobDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function fwDownload(url, target, version) {
+  const name = 'egret-' + String(target).toLowerCase() + '-' + String(version).replace(/[^\w.-]/g, '_') + '.bin';
+  logDiag('firmware: download source ' + stripQuery(url));
+  // Preferred: fetch into a Blob (keeps the bearer and saves straight to Downloads). The download-host
+  // CORS state is unknown, so on any failure fall back to a plain link the browser downloads itself.
+  try {
+    const r = await fetch(url, { headers: fwAuthHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    fwTriggerBlobDownload(blob, name);
+    logSys('firmware: downloaded via fetch -> ' + name + ' (' + blob.size + ' bytes)');
+  } catch (e) {
+    logErr('firmware: blob download failed (' + (e && e.message ? e.message : e) + '), opening as a direct link');
+    const a = document.createElement('a'); a.href = url; a.download = name; a.target = '_blank'; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    logSys('firmware: opened direct link for ' + name + ' (needs a context where the host accepts the request)');
+  }
+}
+
+// --------------------------- init ---------------------------
+window.addEventListener('DOMContentLoaded', () => {
+  initLangSwitch();
+  initTheme();
+  wireDocViewer();
+  buildModelDropdown();
+
+  let savedModel = null; try { savedModel = localStorage.getItem(LS.MODEL); } catch (e) {}
+  setModel((savedModel === 'auto' || MODELS[savedModel]) ? savedModel : 'auto', false);
+  try { const o = localStorage.getItem(LS.OPEN); if (o && $('open-in')) $('open-in').value = o; } catch (e) {}
+  try { const k = localStorage.getItem(LS.EKFV); if (k && $('ekfv-in')) $('ekfv-in').value = k; } catch (e) {}
+  applyLang();
+  setStatus('disconnected');
+  eyOk = eySelfTest();
+  logDiagnosticHeader();
+
+  $('model-in').addEventListener('change', e => { setModel(e.target.value, true); const c = cap(); logLine('', 'model: ' + (c ? c.label : 'auto detect') + ' [' + transportDesc(c) + ']'); });
+  $('btn-conn').addEventListener('click', () => { if ($('btn-conn').dataset.act === 'disconnect') disconnect(); else guard(connect); });
+  { const o = $('open-in'); if (o) o.addEventListener('change', () => { try { localStorage.setItem(LS.OPEN, o.value); } catch (e) {} }); }
+  { const k = $('ekfv-in'); if (k) k.addEventListener('change', () => { try { localStorage.setItem(LS.EKFV, k.value); } catch (e) {} updateSpeedUI(); }); }
+
+  // Single button, labeled from the live device state (SETTINGS_STATUS byte 11). Unlock writes the open
+  // value, Lock the eKFV value. The label follows the real limit reported by the scooter, not a DOM flag.
+  $('btn-toggle').addEventListener('click', () => guard(async () => {
+    const id = ($('btn-toggle').dataset.mode === 'lock') ? 'ekfv-in' : 'open-in';
+    const v = parseInt($(id).value, 10);
+    if (!(v >= 1 && v <= 99)) { logErr('enter a value 1..99'); return; }
+    await setSpeedLimit(v);
+    // The device reports the new limit via SETTINGS_STATUS notify -> updateSpeedUI flips the label.
+  }));
+
+  $('btn-gear').addEventListener('click', () => guard(() => eyGear($('gear-in').value)));
+  $('btn-mode').addEventListener('click', () => guard(() => sendOperation(6, [parseInt($('mode-in').value, 10) & 0xff])));
+  $('btn-bright').addEventListener('click', () => guard(() => sendSettings(2, [parseInt($('bright-in').value, 10) & 0xff])));
+  $('btn-headlight').addEventListener('click', () => guard(() => sendSettings(13, [parseInt($('headlight-in').value, 10) & 0xff])));
+  $('btn-light').addEventListener('click', () => guard(() => fam() === 'ey' ? eyLight($('light-in').value === '1') : sendOperation(3, [$('light-in').value === '1' ? 1 : 0])));
+  $('btn-unit').addEventListener('click', () => guard(() => { const mph = $('unit-in').value === '1'; return fam() === 'ey' ? eyUnit(mph) : sendSettings(9, [mph ? 1 : 0]); }));
+  $('btn-reset-trip').addEventListener('click', () => guard(() => sendOperation(9, [])));
+  $('btn-reset-total').addEventListener('click', () => guard(() => sendOperation(11, [])));
+  $('btn-immob-lock').addEventListener('click', () => guard(() => fam() === 'ey' ? eyLock(true) : sendOperation(2, [1])));
+  $('btn-immob-unlock').addEventListener('click', () => guard(() => fam() === 'ey' ? eyLock(false) : sendOperation(2, [0])));
+  $('btn-lang').addEventListener('click', () => guard(() => sendSettings(1, [parseInt($('lang-in').value, 10) & 0xff])));
+  $('btn-alwayson').addEventListener('click', () => guard(() => sendSettings(10, [$('alwayson-in').value === '1' ? 1 : 0])));
+  $('btn-tempwarn').addEventListener('click', () => guard(() => sendOperation(7, [parseInt($('tempwarn-in').value, 10) & 0xff])));
+  $('btn-range').addEventListener('click', () => guard(() => sendOperation(8, [Math.max(0, Math.min(100, parseInt($('range-in').value, 10) || 0)) & 0xff])));
+  $('btn-unlockreq').addEventListener('click', () => guard(() => sendSettings(3, [$('unlockreq-in').value === '1' ? 1 : 0])));
+  $('btn-unlockcode').addEventListener('click', () => guard(() => setUnlockCode($('unlockcode-in').value)));
+  $('btn-text').addEventListener('click', () => guard(() => setFreeText($('text-in').value)));
+  $('btn-custname').addEventListener('click', () => guard(() => setCustomerName($('custname-in').value)));
+  $('btn-cruise').addEventListener('click', () => guard(() => eyCruise($('cruise-in').value === '1')));
+
+  // Firmware (Egret account, cloud). Independent of the BLE connection. Token stays in memory only.
+  { const b = $('fw-btn-magic'); if (b) b.addEventListener('click', () => guard(fwMagicRequest)); }
+  { const b = $('fw-btn-verify'); if (b) b.addEventListener('click', () => guard(fwMagicVerify)); }
+  { const b = $('fw-btn-logout'); if (b) b.addEventListener('click', () => fwLogout()); }
+  { const b = $('fw-btn-list'); if (b) b.addEventListener('click', () => guard(fwList)); }
+  { const b = $('fw-btn-check'); if (b) b.addEventListener('click', () => guard(fwCheck)); }
+
+  document.querySelectorAll('.help-btn').forEach(btn => btn.addEventListener('click', () => openHelp(btn.getAttribute('data-help'))));
+  ['help-x', 'help-close'].forEach(id => { const b = $(id); if (b) b.addEventListener('click', closeHelp); });
+  { const b = $('link-disclaimer'); if (b) b.addEventListener('click', e => { e.preventDefault(); openDocFile(docFile('DISCLAIMER'), 'footDisclaimer'); }); }
+
+  // Log options: Public Log anonymizes (default on, persisted); diagnostics adds verbose lines (off).
+  { const cb = $('public-log');
+    if (cb) {
+      let saved = null; try { saved = localStorage.getItem(LS.PUBLOG); } catch (e) {}
+      publicLog = saved !== '0';
+      cb.checked = publicLog;
+      cb.addEventListener('change', () => { publicLog = cb.checked; try { localStorage.setItem(LS.PUBLOG, cb.checked ? '1' : '0'); } catch (e) {} logSys('public-log: ' + (cb.checked ? 'on (anonymizing device name/id)' : 'off')); renderLog(); });
+    } }
+  { const cb = $('diag-log');
+    if (cb) {
+      diag = false; cb.checked = false;
+      cb.addEventListener('change', () => { diag = cb.checked; logSys(diag ? 'diagnostic log on' : 'diagnostic log off'); if (diag) logDiagnosticHeader(); });
+    } }
+  $('btn-clear-log').addEventListener('click', () => { logBuffer = []; $('log').textContent = ''; eyOk = eySelfTest(); logDiagnosticHeader(); });
+  $('btn-copy-log').addEventListener('click', () => navigator.clipboard.writeText(logText()).then(() => logSys('log copied')).catch(() => {}));
+  $('btn-save-log').addEventListener('click', saveLog);
+});
+
+// EY convenience commands used by the shared buttons.
+async function eyLight(on) { if (!eyOk) return; return eySend(0x23, 0x04, on ? [0x20, 0x20] : [0x00, 0x20], on ? 'lights on' : 'lights off'); }
+async function eyLock(on) { if (!eyOk) return; return eySend(0x23, 0x02, on ? [0x01, 0x01] : [0x00, 0x01], on ? 'lock' : 'unlock'); }
+async function eyUnit(mph) { if (!eyOk) return; return eySend(0x23, 0x02, mph ? [0x80, 0x80] : [0x00, 0x80], mph ? 'unit mph' : 'unit km/h'); }
+async function eyCruise(on) { if (!eyOk) return; return eySend(0x23, 0x02, on ? [0x00, 0x04] : [0x04, 0x04], on ? 'cruise on' : 'cruise off'); }
